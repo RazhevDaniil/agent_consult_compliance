@@ -1,0 +1,43 @@
+namespace: agnbf-dt-kmhelp-corpdep
+wrapper: 1.0.0.aef.fastapi
+
+app:
+  author: Ражев Даниил Сергеевич
+  emails:
+    - DSRazhev@sberbank.ru
+    - MAKolodyazhny@sberbank.ru
+    - MVaZakharov@sberbank.ru
+  unit: УМиИД. Блок Финансов
+  description: AI-агент по вопросам методологии ценообразования на продукты срочных  СЮЛ. Аналитика по изменению лимитов КПК
+
+  language: PYTHON
+
+  pyinstaller:
+    copy-metadata:
+      - requests
+      - httpx
+      - aiohttp
+      - aiokafka
+
+  connections:
+    endpoints:
+      - alias: GIGACHAT_API_URL
+        description: Ссылка на Gigachat Rest API
+      - alias: DB_APP_URL
+        description: Ссылка на эндпоинт сервиса работы с БД
+      - alias: PALM_SECURITY_API_URL
+        description: Ссылка на эндпоинт сервиса PALM.Security
+      - alias: POD_NAMESPACE
+        description: Идентификатор пространства имен
+      - alias: TRACING_SERVICE_KAFKA_BOOTSTRAP_SERVERS
+        description: Хосты брокера кафки для передачи трейсинга в ФП AEF Controller
+      - alias: TRACING_SERVICE_KAFKA_OUTBOX_TOPIC
+        description: Топик брокера кафки для передачи трейсинга в ФП AEF Controller
+      - alias: POSTGRES-DB
+        description: URL для подключения к БД
+  envs:
+    APP_HOST: "0.0.0.0"
+    APP_PORT: "8081"
+    AGENT_ID: CI13858148
+    CLUSTER_ID:
+    DISTRIBUTIVE:
