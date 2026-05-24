@@ -3,15 +3,9 @@ import re
 import uuid
 import httpx
 import logging
-from tenacity import (
-    RetryCallState,
-    Retrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
 
 from .config import ADAPTERS_API_BASE_URL, TIMEOUT, ERROR_TEXT, _AUTH_HEADER_NAME, _TRACE_HEADER_NAME, settings
+from .http_retry import post_json_with_retry
 from .tracing import (
     aef_custom_span,
     get_hops,
@@ -121,28 +115,6 @@ def _auth_headers(auth_header: str | None, trace_id: str | None = None) -> dict:
     return headers
 
 
-def _retryable_status(status_code: int) -> bool:
-    return status_code >= 500 or status_code == 429
-
-
-def _log_http_retry(retry_state: RetryCallState) -> None:
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    _LOGGER.info(f"--- HTTP RETRY: {retry_state.attempt_number}. Exc: {exc}")
-
-
-def _http_retrying() -> Retrying:
-    return Retrying(
-        retry=retry_if_exception_type(httpx.HTTPError),
-        stop=stop_after_attempt(settings.http_max_retries),
-        wait=wait_exponential_jitter(
-            initial=settings.http_retry_base,
-            max=settings.http_retry_max,
-        ),
-        before_sleep=_log_http_retry,
-        reraise=True,
-    )
-
-
 # -------------------------------------------------------------------
 # Tool: анализ изменения лимитов КПК
 # -------------------------------------------------------------------
@@ -243,21 +215,23 @@ def execute_kpk_limits_tool(
             "http.url": url,
             "aef.request_payload": safe_trace_payload(body),
         }) as span:
-            # SECURITY §22: retry on 5xx/429/network; 4xx propagates.
-            for attempt in _http_retrying():
-                with attempt:
-                    record_hop(trace_id)
-                    resp = httpx.post(url, json=body, headers=headers, timeout=TIMEOUT)
-                    safe_add_span_attributes(
-                        span,
-                        **{
-                            "http.status_code": resp.status_code,
-                            "aef.hops_used": get_hops(trace_id),
-                        },
-                    )
-                    if _retryable_status(resp.status_code):
-                        resp.raise_for_status()
-            resp.raise_for_status()
+            def _on_response(resp: httpx.Response) -> None:
+                record_hop(trace_id)
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": resp.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                    },
+                )
+
+            resp = post_json_with_retry(
+                url,
+                json=body,
+                headers=headers,
+                timeout=TIMEOUT,
+                on_response=_on_response,
+            )
 
             # Валидируем
             payload = _decode_json_response(resp, url=url, log_prefix="kpk_tool")
@@ -279,11 +253,11 @@ def execute_kpk_limits_tool(
     except httpx.HTTPError as e:
         _LOGGER.error(f"--- ERROR in KPK LIMITS TOOL API (network). {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"KPK LIMITS TOOL network error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
     except Exception as e:
         _LOGGER.error(f"--- ERROR in KPK LIMITS TOOL API. {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"KPK LIMITS TOOL error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
 
 
 def download_incorrect_deals_report(
@@ -319,21 +293,23 @@ def download_incorrect_deals_report(
             "http.url": url,
             "aef.request_payload": safe_trace_payload(body),
         }) as span:
-            # SECURITY §22: retry on 5xx/429/network; 4xx propagates.
-            for attempt in _http_retrying():
-                with attempt:
-                    record_hop(trace_id)
-                    resp = httpx.post(url, json=body, headers=headers, timeout=TIMEOUT)
-                    safe_add_span_attributes(
-                        span,
-                        **{
-                            "http.status_code": resp.status_code,
-                            "aef.hops_used": get_hops(trace_id),
-                        },
-                    )
-                    if _retryable_status(resp.status_code):
-                        resp.raise_for_status()
-            resp.raise_for_status()
+            def _on_response(resp: httpx.Response) -> None:
+                record_hop(trace_id)
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": resp.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                    },
+                )
+
+            resp = post_json_with_retry(
+                url,
+                json=body,
+                headers=headers,
+                timeout=TIMEOUT,
+                on_response=_on_response,
+            )
 
             filename = _extract_filename(resp.headers.get("Content-Disposition"))
             if not filename:
@@ -357,11 +333,11 @@ def download_incorrect_deals_report(
     except httpx.HTTPError as e:
         _LOGGER.error(f"--- ERROR in INCORRECT DEALS REPORT API (network). {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"Incorrect deals report network error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
     except Exception as e:
         _LOGGER.error(f"--- ERROR in INCORRECT DEALS REPORT API. {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"Incorrect deals report error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
 
 
 def _extract_filename(content_disposition: str | None) -> str | None:

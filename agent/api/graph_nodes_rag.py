@@ -8,7 +8,7 @@ import logging
 
 from .config import settings
 
-from .models import (RouteQuery, RagAnswerWithConfidence, Critique,
+from .models import (RouteQuery, RagAnswerWithConfidence, Critique, MinimalContext,
 RewrittenQuestion, RegenerateResult)
 
 from .llm_setup import answer_llm, utility_llm
@@ -20,7 +20,7 @@ from .tech_funcs import sanitize_formulas, _format_docs, _trace_node
 from .graph_state import (GraphState, retriever, router_chain,
 rag_chain_with_confidence, critique_chain, rag_context_chain)
 
-from .graph_llm_wrappers import (_ainvoke_structured_with_default,
+from .graph_llm_wrappers import (_ainvoke_structured_with_default, _ainvoke_with_retry,
 _coerce_regenerate_result, _rerank_with_llm)
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +49,13 @@ async def retrieve_documents(state: GraphState):
         q_orig = state["input"]
 
         try:
-            rw = await rag_context_chain().ainvoke({"input": q_orig, "chat_history": state.get("messages", [])[-1:]})
+            rw = await _ainvoke_structured_with_default(
+                rag_context_chain(),
+                {"input": q_orig, "chat_history": state.get("messages", [])[-1:]},
+                MinimalContext,
+                {"is_referal": False, "minimal_context": []},
+                "rag_context",
+            )
             q_ctx = f"Контекст в понятиях: {rw.minimal_context}"
         except Exception:
             q_ctx = "Контекста нет"
@@ -112,9 +118,13 @@ async def refine_and_reretrieve(state: GraphState):
 
         # Асинхронный перефраз
         try:
-            rewritten = await (
-                        contextualize_q_prompt_template | utility_llm().with_structured_output(RewrittenQuestion)).ainvoke(
-                payload)
+            rewritten = await _ainvoke_structured_with_default(
+                contextualize_q_prompt_template | utility_llm().with_structured_output(RewrittenQuestion),
+                payload,
+                RewrittenQuestion,
+                {"question": base_q},
+                "refine_contextualize",
+            )
             aug_q = f"{base_q}\n\n(Уточненная формулировка для поиска: {rewritten.question})"
         except Exception as e:
             _LOGGER.warning(
@@ -179,13 +189,20 @@ async def regenerate_answer(state: GraphState):
         try:
             raw = None
             try:
-                raw = await (regenerate_prompt_template | answer_llm().with_structured_output(RegenerateResult)).ainvoke(
-                    payload)
+                raw = await _ainvoke_with_retry(
+                    regenerate_prompt_template | answer_llm().with_structured_output(RegenerateResult),
+                    payload,
+                    node_name="regenerate_structured",
+                )
             except Exception:
                 pass
 
             if raw is None:
-                raw = await (regenerate_prompt_template | answer_llm()).ainvoke(payload)
+                raw = await _ainvoke_with_retry(
+                    regenerate_prompt_template | answer_llm(),
+                    payload,
+                    node_name="regenerate_text",
+                )
 
             out = _coerce_regenerate_result(raw)
 

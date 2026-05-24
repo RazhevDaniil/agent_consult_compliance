@@ -15,7 +15,12 @@ from .tech_funcs import (sanitize_formulas, _fmt6, _trace_node, _format_docs,
 from .tools import execute_tool, execute_report_tool
 from .graph_state import (GraphState, retriever, tool_router_chain,
                           explainer_chain, user2theory_chain, tool2theory_chain)
-from .graph_llm_wrappers import _rerank_with_llm
+from .models import RewrittenQuestion, ToolRoute
+from .graph_llm_wrappers import (
+    _ainvoke_structured_with_default,
+    _ainvoke_text_with_default,
+    _rerank_with_llm,
+)
 
 _LOGGER = logging.getLogger(__name__)
 audit = logging.getLogger('aif_audit')
@@ -118,7 +123,13 @@ async def execute_tool_node(state: GraphState, config=None):
     operation_uid = configurable.get("operation_uid")
     chat_id = configurable.get("thread_id") or "default"
     with _trace_node("execute_tool"):
-        route = await tool_router_chain().ainvoke({"input": state["input"], "chat_history": state.get("messages", [])})
+        route = await _ainvoke_structured_with_default(
+            tool_router_chain(),
+            {"input": state["input"], "chat_history": state.get("messages", [])},
+            ToolRoute,
+            {"tool": "none", "reason": "LLM недоступен: используем эвристику маршрутизации."},
+            "tool_router",
+        )
 
         tool = route.tool  # "pricing", "limits", "deals_report" или "none"
 
@@ -203,7 +214,19 @@ async def execute_tool_node(state: GraphState, config=None):
                 tool_cache=tool_cache_in,
             )
 
-        res, from_cache, tool_cache_out = await loop.run_in_executor(None, _run_tool)
+        try:
+            res, from_cache, tool_cache_out = await loop.run_in_executor(None, _run_tool)
+        except Exception as e:
+            _LOGGER.error("execute_tool_failed_after_retry. chat_id=%s error=%s", chat_id, e)
+            audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"ERROR due calculation. Chat ID: {chat_id} . Error: {e}"}})
+            return {
+                "answer": "Кажется я сломался, но скоро все починим! Если необходима помощь, обратитесь в поддержку FCBusinessSupportTeam@sberbank.ru.",
+                "sources": [],
+                "confidence_score": 5,
+                "tool_payload": None,
+                "requested_components": [],
+                "response_state": "failed",
+            }
 
         if res.get("status") != "success":
             err = res.get("error", "Расчёт не выполнен.")
@@ -477,15 +500,27 @@ async def retrieve_documents_for_explain(state: GraphState):
             theory_q = _make_theory_question_from_user(user_input, tool=tool, requested_components=requested_components)
 
             if not theory_q:
-                rq = await user2theory_chain().ainvoke({
-                    "tool": tool,
-                    "user_input": user_input,
-                    "requested_components": requested_components,
-                })
+                rq = await _ainvoke_structured_with_default(
+                    user2theory_chain(),
+                    {
+                        "tool": tool,
+                        "user_input": user_input,
+                        "requested_components": requested_components,
+                    },
+                    RewrittenQuestion,
+                    {"question": ""},
+                    "user2theory",
+                )
                 theory_q = (rq.question or "").strip()
 
             if not theory_q:
-                rq = await tool2theory_chain().ainvoke(payload)
+                rq = await _ainvoke_structured_with_default(
+                    tool2theory_chain(),
+                    payload,
+                    RewrittenQuestion,
+                    {"question": ""},
+                    "tool2theory",
+                )
                 theory_q = (rq.question or "").strip()
 
             # AEFHandler автоматически создаёт `retriever` span для FAISS.ainvoke.
@@ -539,14 +574,17 @@ async def generate_explainer(state: GraphState):
             }
 
         try:
-            expl = await explainer_chain().ainvoke(
+            llm_text = await _ainvoke_text_with_default(
+                explainer_chain(),
                 {
                     "explain_targets": theory_q or "Общее пояснение по методологии",
                     "context": context_str,
                     "chat_history": state.get("messages", [])
-                }
+                },
+                default_text=default_text,
+                node_name="generate_explainer",
             )
-            llm_text = sanitize_formulas(getattr(expl, "content", str(expl)))
+            llm_text = sanitize_formulas(llm_text)
         except Exception:
             llm_text = default_text
 
