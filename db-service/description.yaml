@@ -1,0 +1,21 @@
+wrapper: 1.0.0.fastapi
+app:
+  author: Колодяжный Максим Алексеевич
+  emails:
+    - DSRazhev@sberbank.ru
+    - MAKolodyazhny@sberbank.ru
+  unit: УМиИД. Блок Финансов
+  description: Сервис сохранения данных в БД от агента и business-logic services
+  language: PYTHON
+  pyinstaller:
+    hidden-import:
+      - asyncpg.pgproto.pgproto
+      - sqlalchemy
+      - pydantic_settings
+  connections:
+    databases:
+      - alias: deal-agent-db
+        description: PostgreSQL база данных для хранения писем и очереди задач
+        changelog:
+          searchPath: migration/deal-agent-db
+          changelogFile: changelog.sql

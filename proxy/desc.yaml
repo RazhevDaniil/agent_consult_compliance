@@ -1,0 +1,24 @@
+namespace: agnbf-dt-kmhelp-corpdep
+wrapper: 1.0.0.aef.fastapi
+
+app:
+  author: Ражев Даниил Сергеевич
+  emails:
+    - DSRazhev@sberbank.ru
+    - MAKolodyazhny@sberbank.ru
+    - MVaZakharov@sberbank.ru
+  unit: УМиИД. Блок Финансов
+  description: Proxy-сервис для интеграции с оркестратором ЛИСЫ и маршрутизации на агента СЮЛ
+
+  language: PYTHON
+
+  connections:
+    endpoints:
+      - alias: DOWNSTREAM_DEPO_AGENT_URL
+        description: URL агента СЮЛ
+      - alias: TREASURY_SUPERVISOR_URL
+        description: URL СУПЕРВИЗОРА
+
+  envs:
+    APP_HOST: "0.0.0.0"
+    APP_PORT: "8082"
