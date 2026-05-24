@@ -61,6 +61,7 @@ class AppSettings(BaseSettings):
     graph_timeout_sec: int = 600
     graph_max_retries: int = 2
     graph_retry_backoff_base: float = 0.6
+    agent_hops_limit: int = 20
 
     # === LLM retry ===
     http_max_retries: int = 3
@@ -110,6 +111,7 @@ class AppSettings(BaseSettings):
     # POD_NAMESPACE, DISTRIBUTIVE). AEF_*-prefixed env vars are accepted as
     # a fallback so legacy deployment configs keep working.
     tracing_service_kafka_outbox_topic: str = Field(default="", validation_alias="TRACING_SERVICE_KAFKA_OUTBOX_TOPIC")
+    tracing_max_payload_size: int = Field(default=10000, validation_alias="TRACING_MAX_PAYLOAD_SIZE")
     kafka_hosts: Annotated[list[str], NoDecode] = Field(
         alias="TRACING_SERVICE_KAFKA_BOOTSTRAP_SERVERS"
     )

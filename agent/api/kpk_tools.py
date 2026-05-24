@@ -1,16 +1,19 @@
 import json
 import re
+import uuid
 import httpx
 import logging
-from tenacity import (
-    RetryCallState,
-    Retrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
 
 from .config import ADAPTERS_API_BASE_URL, TIMEOUT, ERROR_TEXT, _AUTH_HEADER_NAME, _TRACE_HEADER_NAME, settings
+from .http_retry import post_json_with_retry
+from .tracing import (
+    aef_custom_span,
+    get_hops,
+    record_hop,
+    safe_add_output_result,
+    safe_add_span_attributes,
+    safe_trace_payload,
+)
 
 from .kpk_models import KpkLimitToolRequest, KpkLimitToolResponse
 
@@ -112,28 +115,6 @@ def _auth_headers(auth_header: str | None, trace_id: str | None = None) -> dict:
     return headers
 
 
-def _retryable_status(status_code: int) -> bool:
-    return status_code >= 500 or status_code == 429
-
-
-def _log_http_retry(retry_state: RetryCallState) -> None:
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    _LOGGER.info(f"--- HTTP RETRY: {retry_state.attempt_number}. Exc: {exc}")
-
-
-def _http_retrying() -> Retrying:
-    return Retrying(
-        retry=retry_if_exception_type(httpx.HTTPError),
-        stop=stop_after_attempt(settings.http_max_retries),
-        wait=wait_exponential_jitter(
-            initial=settings.http_retry_base,
-            max=settings.http_retry_max,
-        ),
-        before_sleep=_log_http_retry,
-        reraise=True,
-    )
-
-
 # -------------------------------------------------------------------
 # Tool: анализ изменения лимитов КПК
 # -------------------------------------------------------------------
@@ -151,6 +132,7 @@ def execute_kpk_limits_tool(
         lookback_days: int | None = None,
         auth_header: str | None = None,
         trace_id: str | None = None,
+        operation_uid: str | None = None,
 ) -> dict:
     """Вызывает tool для анализа лимитов КПК
 
@@ -217,36 +199,65 @@ def execute_kpk_limits_tool(
 
         headers = _auth_headers(auth_header, trace_id)
 
-        # SECURITY §22: retry on 5xx/429/network; 4xx propagates.
-        for attempt in _http_retrying():
-            with attempt:
-                resp = httpx.post(url, json=body, headers=headers, timeout=TIMEOUT)
-                if _retryable_status(resp.status_code):
-                    resp.raise_for_status()
-        resp.raise_for_status()
+        service_operation_uid = str(uuid.uuid4())
+        with aef_custom_span(span_attributes={
+            "aef.kind": "service_call",
+            "aef.call_type": "api_call",
+            "aef.action": f"kpk.{mode}",
+            "aef.target_name": "PALM.Security/KPK",
+            "aef.is_mutation": False,
+            "aef.rollback_possible": None,
+            "aef.trace_id": trace_id,
+            "aef.operation_uid": service_operation_uid,
+            "aef.parent_operation_uid": operation_uid or trace_id,
+            _TRACE_HEADER_NAME: trace_id,
+            "http.method": "POST",
+            "http.url": url,
+            "aef.request_payload": safe_trace_payload(body),
+        }) as span:
+            def _on_response(resp: httpx.Response) -> None:
+                record_hop(trace_id)
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": resp.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                    },
+                )
 
-        # Валидируем
-        payload = _decode_json_response(resp, url=url, log_prefix="kpk_tool")
-        try:
-            parsed = KpkLimitToolResponse(**payload)
-        except Exception as e:
-            _LOGGER.error(
-                "kpk_response_validation_failed. error=%s payload_summary=%s",
-                e,
-                _payload_summary(payload),
+            resp = post_json_with_retry(
+                url,
+                json=body,
+                headers=headers,
+                timeout=TIMEOUT,
+                on_response=_on_response,
             )
-            raise
+
+            # Валидируем
+            payload = _decode_json_response(resp, url=url, log_prefix="kpk_tool")
+            safe_add_span_attributes(span, **{"aef.response_payload": safe_trace_payload(_payload_summary(payload))})
+            safe_add_output_result(span, output=_payload_summary(payload))
+            try:
+                parsed = KpkLimitToolResponse(**payload)
+            except Exception as e:
+                _LOGGER.error(
+                    "kpk_response_validation_failed. error=%s payload_summary=%s",
+                    e,
+                    _payload_summary(payload),
+                )
+                safe_add_span_attributes(span, **{"aef.error_message": str(e)})
+                raise
         _LOGGER.info(f"kpk_response_ok: {parsed.status}")
         return parsed.model_dump()
 
     except httpx.HTTPError as e:
         _LOGGER.error(f"--- ERROR in KPK LIMITS TOOL API (network). {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"KPK LIMITS TOOL network error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
     except Exception as e:
         _LOGGER.error(f"--- ERROR in KPK LIMITS TOOL API. {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"KPK LIMITS TOOL error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
 
 
 def download_incorrect_deals_report(
@@ -254,6 +265,7 @@ def download_incorrect_deals_report(
         report_dt: str,
         auth_header: str | None = None,
         trace_id: str | None = None,
+        operation_uid: str | None = None,
 ) -> dict:
     if ADAPTERS_API_BASE_URL is None:
         return {"status": "error", "error": ERROR_TEXT}
@@ -265,33 +277,67 @@ def download_incorrect_deals_report(
 
     try:
         headers = _auth_headers(auth_header, trace_id)
-        # SECURITY §22: retry on 5xx/429/network; 4xx propagates.
-        for attempt in _http_retrying():
-            with attempt:
-                resp = httpx.post(url, json=body, headers=headers, timeout=TIMEOUT)
-                if _retryable_status(resp.status_code):
-                    resp.raise_for_status()
-        resp.raise_for_status()
+        service_operation_uid = str(uuid.uuid4())
+        with aef_custom_span(span_attributes={
+            "aef.kind": "service_call",
+            "aef.call_type": "api_call",
+            "aef.action": "kpk.incorrect_deals_report",
+            "aef.target_name": "PALM.Security/KPK",
+            "aef.is_mutation": False,
+            "aef.rollback_possible": None,
+            "aef.trace_id": trace_id,
+            "aef.operation_uid": service_operation_uid,
+            "aef.parent_operation_uid": operation_uid or trace_id,
+            _TRACE_HEADER_NAME: trace_id,
+            "http.method": "POST",
+            "http.url": url,
+            "aef.request_payload": safe_trace_payload(body),
+        }) as span:
+            def _on_response(resp: httpx.Response) -> None:
+                record_hop(trace_id)
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": resp.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                    },
+                )
 
-        filename = _extract_filename(resp.headers.get("Content-Disposition"))
-        if not filename:
-            filename = f"new_deals_report_{report_dt.replace('-', '')}.xlsx"
+            resp = post_json_with_retry(
+                url,
+                json=body,
+                headers=headers,
+                timeout=TIMEOUT,
+                on_response=_on_response,
+            )
 
-        _LOGGER.info(f"incorrect_deals_report_ok. filename: {filename}")
-        return {
-            "status": "success",
-            "content": resp.content,
-            "filename": filename,
-            "media_type": resp.headers.get("Content-Type"),
-        }
+            filename = _extract_filename(resp.headers.get("Content-Disposition"))
+            if not filename:
+                filename = f"new_deals_report_{report_dt.replace('-', '')}.xlsx"
+
+            response_meta = {
+                "status": "success",
+                "filename": filename,
+                "media_type": resp.headers.get("Content-Type"),
+                "content_len": len(resp.content or b""),
+            }
+            safe_add_span_attributes(span, **{"aef.response_payload": safe_trace_payload(response_meta)})
+            safe_add_output_result(span, output=response_meta)
+            _LOGGER.info(f"incorrect_deals_report_ok. filename: {filename}")
+            return {
+                "status": "success",
+                "content": resp.content,
+                "filename": filename,
+                "media_type": resp.headers.get("Content-Type"),
+            }
     except httpx.HTTPError as e:
         _LOGGER.error(f"--- ERROR in INCORRECT DEALS REPORT API (network). {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"Incorrect deals report network error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
     except Exception as e:
         _LOGGER.error(f"--- ERROR in INCORRECT DEALS REPORT API. {e}")
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"Incorrect deals report error: {e}"}})
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
 
 
 def _extract_filename(content_disposition: str | None) -> str | None:
