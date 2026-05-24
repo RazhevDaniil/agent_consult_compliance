@@ -6,16 +6,10 @@ import dataclasses
 import logging
 from decimal import Decimal
 from datetime import date, datetime
-from tenacity import (
-    RetryCallState,
-    Retrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
 from typing import Literal, Tuple, Dict, Any, Optional
 
-from .config import ADAPTERS_API_BASE_URL, TIMEOUT, ERROR_TEXT, _AUTH_HEADER_NAME, _TRACE_HEADER_NAME, settings
+from .config import ADAPTERS_API_BASE_URL, TIMEOUT, ERROR_TEXT, _AUTH_HEADER_NAME, _TRACE_HEADER_NAME
+from .http_retry import post_json_with_retry
 from .tracing import (
     aef_custom_span,
     get_hops,
@@ -116,28 +110,6 @@ def _decode_json_response(response: httpx.Response, *, url: str, log_prefix: str
 
     _LOGGER.info("%s_json_payload. summary=%s", log_prefix, _payload_summary(payload))
     return payload
-
-
-def _retryable_status(status_code: int) -> bool:
-    return status_code >= 500 or status_code == 429
-
-
-def _log_http_retry(retry_state: RetryCallState) -> None:
-    exc = retry_state.outcome.exception() if retry_state.outcome else None
-    _LOGGER.info(f"http_retry. attempt={retry_state.attempt_number}. next_wait_sec={retry_state.next_action.sleep}. exc={exc}")
-
-
-def _http_retrying() -> Retrying:
-    return Retrying(
-        retry=retry_if_exception_type(httpx.HTTPError),
-        stop=stop_after_attempt(settings.http_max_retries),
-        wait=wait_exponential_jitter(
-            initial=settings.http_retry_base,
-            max=settings.http_retry_max,
-        ),
-        before_sleep=_log_http_retry,
-        reraise=True,
-    )
 
 
 def _auth_headers(auth_header: str | None, trace_id: str | None = None) -> Dict[str, str]:
@@ -268,26 +240,24 @@ def execute_tool(
             "http.url": url,
             "aef.request_payload": safe_trace_payload(body),
         }) as span:
-            # 3. Отправка запроса (SECURITY §22: retry on 5xx/429/network)
-            for attempt in _http_retrying():
-                with attempt:
-                    record_hop(trace_id)
-                    response = httpx.post(
-                        url,
-                        json=body,
-                        headers=headers,
-                        timeout=TIMEOUT
-                    )
-                    safe_add_span_attributes(
-                        span,
-                        **{
-                            "http.status_code": response.status_code,
-                            "aef.hops_used": get_hops(trace_id),
-                        },
-                    )
-                    if _retryable_status(response.status_code):
-                        response.raise_for_status()
-            response.raise_for_status()
+            def _on_response(response: httpx.Response) -> None:
+                record_hop(trace_id)
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": response.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                    },
+                )
+
+            # RR-AI-5: common retry helper retries only RequestError and 500/502/503/504.
+            response = post_json_with_retry(
+                url,
+                json=body,
+                headers=headers,
+                timeout=TIMEOUT,
+                on_response=_on_response,
+            )
 
             # 4. Валидация ответа через PipelineResponse
             payload = _decode_json_response(response, url=url, log_prefix="pss")
@@ -309,10 +279,7 @@ def execute_tool(
 
     except Exception as e:
         _LOGGER.error(f"pss_request_failed. error: {e}")
-        return {
-            "status": "error",
-            "error": ERROR_TEXT
-        }, False, cache_in
+        raise
 
     cache_out = dict(cache_in)
     if res.get("status") == "success":
@@ -365,26 +332,23 @@ def execute_report_tool(
             "http.url": url,
             "aef.request_payload": safe_trace_payload(body),
         }) as span:
-            # 2. Отправляем (SECURITY §22: retry on 5xx/429/network)
-            for attempt in _http_retrying():
-                with attempt:
-                    record_hop(trace_id)
-                    response = httpx.post(
-                        url,
-                        json=body,
-                        headers=headers,
-                        timeout=TIMEOUT
-                    )
-                    safe_add_span_attributes(
-                        span,
-                        **{
-                            "http.status_code": response.status_code,
-                            "aef.hops_used": get_hops(trace_id),
-                        },
-                    )
-                    if _retryable_status(response.status_code):
-                        response.raise_for_status()
-            response.raise_for_status()
+            def _on_response(response: httpx.Response) -> None:
+                record_hop(trace_id)
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": response.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                    },
+                )
+
+            response = post_json_with_retry(
+                url,
+                json=body,
+                headers=headers,
+                timeout=TIMEOUT,
+                on_response=_on_response,
+            )
 
             # 3. Валидируем ответ через общий PipelineResponse
             payload = _decode_json_response(response, url=url, log_prefix="report")
@@ -406,7 +370,7 @@ def execute_report_tool(
 
     except Exception as e:
         _LOGGER.error(f"report_request_failed. Error: {e}")
-        return {"status": "error", "error": ERROR_TEXT}
+        raise
 
     if res.get("status") != "success":
         _LOGGER.error(f"report_response_not_success. error: {res.get('error')}")

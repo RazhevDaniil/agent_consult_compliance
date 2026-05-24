@@ -108,10 +108,9 @@ def _classify_gigachat_error(exc: BaseException) -> str:
     return "gigachat_unknown_error"
 
 
-# SECURITY §22/§23: retry transient categories — 429, 5xx, timeout, transport.
-# Validation / 4xx-non-429 errors fall straight through to the node-level fallback.
+# RR-AI-5: retry only transient 5xx/timeout/transport errors. 4xx,
+# including 429, validation and business errors fall through without retry.
 _RETRYABLE_EVENTS = {
-    "gigachat_rate_limited",
     "gigachat_5xx_failed",
     "gigachat_timeout",
     "gigachat_transport_error",
@@ -167,15 +166,27 @@ from .llm_setup import utility_llm
 from .kpk_models import KpkLimitParsedQuery
 
 
+def _invoke_with_retry(runnable, payload, *, node_name: str):
+    for attempt in _llm_retrying_sync():
+        with attempt:
+            return runnable.invoke(payload)
+    raise RuntimeError(f"{node_name} LLM retry loop did not execute")
+
+
+async def _ainvoke_with_retry(runnable, payload, *, node_name: str):
+    async for attempt in _llm_retrying_async():
+        with attempt:
+            return await runnable.ainvoke(payload)
+    raise RuntimeError(f"{node_name} LLM retry loop did not execute")
+
+
 def _invoke_structured_with_default(runnable, payload, model_cls, default_dict, node_name: str):
     """Безопасный инвок: если LLM упал — вернём валидный объект со значениями по умолчанию.
 
     AEF callback is attached once at graph invocation level in app.py.
     """
     try:
-        for attempt in _llm_retrying_sync():
-            with attempt:
-                result = runnable.invoke(payload)
+        result = _invoke_with_retry(runnable, payload, node_name=node_name)
         return result
     except Exception as e:
         _log_llm_exhausted(e, node_name=node_name)
@@ -187,9 +198,7 @@ def _invoke_structured_with_default(runnable, payload, model_cls, default_dict, 
 def _invoke_text_with_default(runnable, payload, *, default_text: str, node_name: str) -> str:
     """Безопасный invoke для неструктурированного ответа"""
     try:
-        for attempt in _llm_retrying_sync():
-            with attempt:
-                out = runnable.invoke(payload)
+        out = _invoke_with_retry(runnable, payload, node_name=node_name)
         return getattr(out, "content", str(out)) if out is not None else default_text
     except Exception as e:
         _log_llm_exhausted(e, node_name=node_name)
@@ -235,7 +244,11 @@ def _rerank_with_llm(question: str, docs: List[Document], top_n: int = 6) -> Lis
             f"Вопрос: {question}\n\nФрагмент:\n{d.page_content[:1200]}"
         )
         try:
-            rank = utility_llm().with_structured_output(_Rank).invoke(prompt)
+            rank = _invoke_with_retry(
+                utility_llm().with_structured_output(_Rank),
+                prompt,
+                node_name="rerank",
+            )
             score = int(rank.score)
         except Exception as e:
             mark_llm_stop_event_if_needed(e)
@@ -247,15 +260,24 @@ def _rerank_with_llm(question: str, docs: List[Document], top_n: int = 6) -> Lis
 
 async def _ainvoke_structured_with_default(runnable, payload, model_cls, default_dict, node_name: str):
     try:
-        async for attempt in _llm_retrying_async():
-            with attempt:
-                result = await runnable.ainvoke(payload)
+        result = await _ainvoke_with_retry(runnable, payload, node_name=node_name)
         return result
     except Exception as e:
         _log_llm_exhausted(e, node_name=node_name)
         _LOGGER.warning(f"[{node_name}] LLM failed, fallback to default: {e}", exc_info=True)
         audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"[{node_name}] LLM failed, fallback to default: {e}"}})
         return model_cls(**default_dict)
+
+
+async def _ainvoke_text_with_default(runnable, payload, *, default_text: str, node_name: str) -> str:
+    try:
+        out = await _ainvoke_with_retry(runnable, payload, node_name=node_name)
+        return getattr(out, "content", str(out)) if out is not None else default_text
+    except Exception as e:
+        _log_llm_exhausted(e, node_name=node_name)
+        _LOGGER.warning(f"[{node_name}] LLM failed, fallback to default: {e}", exc_info=True)
+        audit.info({"code": "C4_FAIL_SERVICE_ACTION", "params": {"object_name": f"[{node_name}] LLM failed, fallback to default: {e}"}})
+        return default_text
 
 
 _KPK_PARSE_TIMEOUT = 120  # секунд — макс. время ожидания structured output от LLM

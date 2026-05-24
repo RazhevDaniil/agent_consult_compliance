@@ -21,6 +21,7 @@ from .config import settings
 from .graph import compiled_graph
 
 from .llm_setup import utility_llm
+from .graph_llm_wrappers import _ainvoke_text_with_default
 from .tracing import (
     aef_agent_start,
     aef_input_request,
@@ -82,14 +83,19 @@ async def _check_gigachat() -> None:
                 "aef.hops_used": 1,
                 "aef.stop_event": None,
             })
-            response = await asyncio.wait_for(
-                utility_llm().ainvoke(
+            llm = utility_llm()
+            callbacks = get_aef_callbacks()
+            if callbacks:
+                llm = llm.with_config({"callbacks": callbacks})
+            content = await asyncio.wait_for(
+                _ainvoke_text_with_default(
+                    llm,
                     "Ответь одним словом: OK",
-                    config={"callbacks": get_aef_callbacks()},
+                    default_text="",
+                    node_name="readiness_gigachat",
                 ),
                 timeout=settings.readiness_gigachat_timeout_sec,
             )
-            content = getattr(response, "content", None) or ""
             if not str(content).strip():
                 raise RuntimeError("gigachat returned empty content")
             result_body = {"status": "ok", "content_len": len(str(content))}

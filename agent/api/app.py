@@ -33,6 +33,7 @@ from .tracing import (
 from .graph import compiled_graph, checkpointer
 from .models import ChatRequest, ChatResponse, IncorrectDealsReportRequest
 from .kpk_tools import download_incorrect_deals_report
+from .http_retry import async_post_json_with_retry
 from .config import (
     settings,
     ERROR_TEXT,
@@ -351,22 +352,26 @@ async def _post_consultant_log(payload: dict) -> None:
             json_payload.pop("operation_uid", None)
             headers = {_TRACE_HEADER_NAME: trace_id} if trace_id else {}
             async with httpx.AsyncClient(timeout=DB_APP_TIMEOUT_SEC) as client:
-                record_hop(trace_id)
-                resp = await client.post(
+                def _on_response(resp: httpx.Response) -> None:
+                    record_hop(trace_id)
+                    safe_add_span_attributes(
+                        span,
+                        **{
+                            "http.status_code": resp.status_code,
+                            "aef.hops_used": get_hops(trace_id),
+                            "aef.response_payload": safe_trace_payload({
+                                "status_code": resp.status_code,
+                                "body": resp.text[:500],
+                            }),
+                        },
+                    )
+
+                resp = await async_post_json_with_retry(
+                    client,
                     f"{DB_APP_URL}/v1/consultant-agent/logs",
                     json=json_payload,
                     headers=headers,
-                )
-                safe_add_span_attributes(
-                    span,
-                    **{
-                        "http.status_code": resp.status_code,
-                        "aef.hops_used": get_hops(trace_id),
-                        "aef.response_payload": safe_trace_payload({
-                            "status_code": resp.status_code,
-                            "body": resp.text[:500],
-                        }),
-                    },
+                    on_response=_on_response,
                 )
                 if resp.status_code >= 400:
                     logger.warning(
@@ -611,13 +616,28 @@ async def incorrect_deals_report_endpoint(
                 "aef.stop_event": None,
                 "aef.request_payload": safe_trace_payload(request_payload),
             })
-            result = await _ensure_incorrect_deals_report_cached(
-                chat_id=request.chat_id,
-                report_dt=request.report_dt,
-                auth_header=authorization,
-                trace_id=trace_id,
-                operation_uid=operation_uid,
-            )
+            try:
+                result = await _ensure_incorrect_deals_report_cached(
+                    chat_id=request.chat_id,
+                    report_dt=request.report_dt,
+                    auth_header=authorization,
+                    trace_id=trace_id,
+                    operation_uid=operation_uid,
+                )
+            except Exception as e:
+                body = {"error": str(e) or ERROR_TEXT}
+                input_req.add_response(
+                    headers={_TRACE_HEADER_NAME: trace_id},
+                    body=body,
+                    http_code=502,
+                )
+                safe_add_span_attributes(agent_span, **{"aef.hops_used": get_hops(trace_id), "aef.stop_event": "phase_error"})
+                safe_add_output_result(agent_span, output={
+                    "response_state": "failed",
+                    "hops_used": get_hops(trace_id),
+                    **body,
+                })
+                raise HTTPException(status_code=502, detail=body["error"])
             safe_add_span_attributes(agent_span, **{"aef.hops_used": get_hops(trace_id)})
             if result.get("status") != "success":
                 body = {"error": result.get("error") or ERROR_TEXT}
