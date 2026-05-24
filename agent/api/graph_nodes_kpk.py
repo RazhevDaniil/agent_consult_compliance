@@ -1013,6 +1013,7 @@ async def kpk_call_tool(state: GraphState, config=None):
     configurable = (config or {}).get("configurable") or {}
     auth_header = configurable.get("auth_header")
     trace_id = configurable.get("trace_id")
+    operation_uid = configurable.get("operation_uid")
     """КПК: вызов инструмента анализа лимитов."""
     parsed = state.get("parsed") or {}
     mode = parsed.get("mode", "single")
@@ -1067,6 +1068,7 @@ async def kpk_call_tool(state: GraphState, config=None):
             lookback_days=parsed.get("lookback_days"),
             auth_header=auth_header,
             trace_id=trace_id,
+            operation_uid=operation_uid,
         )
     except Exception as e:
         _LOGGER.error(

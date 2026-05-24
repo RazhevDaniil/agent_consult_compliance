@@ -115,6 +115,7 @@ async def execute_tool_node(state: GraphState, config=None):
     configurable = (config or {}).get("configurable") or {}
     auth_header = configurable.get("auth_header")
     trace_id = configurable.get("trace_id")
+    operation_uid = configurable.get("operation_uid")
     chat_id = configurable.get("thread_id") or "default"
     with _trace_node("execute_tool"):
         route = await tool_router_chain().ainvoke({"input": state["input"], "chat_history": state.get("messages", [])})
@@ -198,6 +199,7 @@ async def execute_tool_node(state: GraphState, config=None):
                 prefetched_row=prefetched_row,
                 auth_header=auth_header,
                 trace_id=trace_id,
+                operation_uid=operation_uid,
                 tool_cache=tool_cache_in,
             )
 
@@ -397,6 +399,7 @@ async def deals_report(state: GraphState, config=None):
     configurable = (config or {}).get("configurable") or {}
     auth_header = configurable.get("auth_header")
     trace_id = configurable.get("trace_id")
+    operation_uid = configurable.get("operation_uid")
     chat_id = configurable.get("thread_id") or "default"
     with _trace_node("deals_report"):
         current_date = date.today().isoformat()
@@ -418,6 +421,7 @@ async def deals_report(state: GraphState, config=None):
                 inns=inn_list,
                 auth_header=auth_header,
                 trace_id=trace_id,
+                operation_uid=operation_uid,
             )
 
         try:

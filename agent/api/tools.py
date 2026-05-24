@@ -1,5 +1,6 @@
 import json
 import hashlib
+import uuid
 import httpx
 import dataclasses
 import logging
@@ -15,6 +16,14 @@ from tenacity import (
 from typing import Literal, Tuple, Dict, Any, Optional
 
 from .config import ADAPTERS_API_BASE_URL, TIMEOUT, ERROR_TEXT, _AUTH_HEADER_NAME, _TRACE_HEADER_NAME, settings
+from .tracing import (
+    aef_custom_span,
+    get_hops,
+    record_hop,
+    safe_add_output_result,
+    safe_add_span_attributes,
+    safe_trace_payload,
+)
 
 from .tech_funcs import compute_deal_signature, _normalize_context_from_inputs
 
@@ -192,6 +201,7 @@ def execute_tool(
         prefetched_row: Optional[dict] = None,
         auth_header: str | None = None,
         trace_id: str | None = None,
+        operation_uid: str | None = None,
         tool_cache: Optional[Dict[str, dict]] = None,
 ) -> Tuple[dict, bool, Dict[str, dict]]:
     """Шаг 2.5: stateless w.r.t. InMemoryChatStore.
@@ -239,32 +249,60 @@ def execute_tool(
             prefetched_row=prefetched_row
         )
 
-        _LOGGER.info(f"pss_request. req = {request_model.model_dump(exclude_none=True)}")
+        body = request_model.model_dump(exclude_none=True)
+        _LOGGER.info(f"pss_request. req = {body}")
 
-        # 3. Отправка запроса (SECURITY §22: retry on 5xx/429/network)
-        for attempt in _http_retrying():
-            with attempt:
-                response = httpx.post(
-                    url,
-                    json=request_model.model_dump(exclude_none=True),
-                    headers=headers,
-                    timeout=TIMEOUT
+        service_operation_uid = str(uuid.uuid4())
+        with aef_custom_span(span_attributes={
+            "aef.kind": "service_call",
+            "aef.call_type": "api_call",
+            "aef.action": f"pss.{tool}",
+            "aef.target_name": "PALM.Security/PSS",
+            "aef.is_mutation": False,
+            "aef.rollback_possible": None,
+            "aef.trace_id": trace_id,
+            "aef.operation_uid": service_operation_uid,
+            "aef.parent_operation_uid": operation_uid or trace_id,
+            _TRACE_HEADER_NAME: trace_id,
+            "http.method": "POST",
+            "http.url": url,
+            "aef.request_payload": safe_trace_payload(body),
+        }) as span:
+            # 3. Отправка запроса (SECURITY §22: retry on 5xx/429/network)
+            for attempt in _http_retrying():
+                with attempt:
+                    record_hop(trace_id)
+                    response = httpx.post(
+                        url,
+                        json=body,
+                        headers=headers,
+                        timeout=TIMEOUT
+                    )
+                    safe_add_span_attributes(
+                        span,
+                        **{
+                            "http.status_code": response.status_code,
+                            "aef.hops_used": get_hops(trace_id),
+                        },
+                    )
+                    if _retryable_status(response.status_code):
+                        response.raise_for_status()
+            response.raise_for_status()
+
+            # 4. Валидация ответа через PipelineResponse
+            payload = _decode_json_response(response, url=url, log_prefix="pss")
+            safe_add_span_attributes(span, **{"aef.response_payload": safe_trace_payload(_payload_summary(payload))})
+            safe_add_output_result(span, output=_payload_summary(payload))
+            try:
+                api_response = PipelineResponse(**payload)
+            except Exception as e:
+                _LOGGER.error(
+                    "pss_response_validation_failed. error=%s payload_summary=%s",
+                    e,
+                    _payload_summary(payload),
                 )
-                if _retryable_status(response.status_code):
-                    response.raise_for_status()
-        response.raise_for_status()
-
-        # 4. Валидация ответа через PipelineResponse
-        payload = _decode_json_response(response, url=url, log_prefix="pss")
-        try:
-            api_response = PipelineResponse(**payload)
-        except Exception as e:
-            _LOGGER.error(
-                "pss_response_validation_failed. error=%s payload_summary=%s",
-                e,
-                _payload_summary(payload),
-            )
-            raise
+                safe_add_span_attributes(span, **{"aef.error_message": str(e)})
+                raise
 
         res = api_response.model_dump()
         _LOGGER.info(f"pss_response_ok. status = {res.get('status')}")
@@ -289,6 +327,7 @@ def execute_report_tool(
         period_end: Optional[str] = None,
         auth_header: str | None = None,
         trace_id: str | None = None,
+        operation_uid: str | None = None,
 ):
     if ADAPTERS_API_BASE_URL is None:
         return {"status": "error", "error": ERROR_TEXT}
@@ -303,36 +342,64 @@ def execute_report_tool(
             inns=inns
         )
 
-        _LOGGER.info(f"report_request. req = {request_model.model_dump(exclude_none=True)}")
+        body = request_model.model_dump(exclude_none=True)
+        _LOGGER.info(f"report_request. req = {body}")
 
         headers = _auth_headers(auth_header, trace_id)
         if not headers.get(_AUTH_HEADER_NAME):
             _LOGGER.info("report_request_no_auth")
 
-        # 2. Отправляем (SECURITY §22: retry on 5xx/429/network)
-        for attempt in _http_retrying():
-            with attempt:
-                response = httpx.post(
-                    url,
-                    json=request_model.model_dump(exclude_none=True),
-                    headers=headers,
-                    timeout=TIMEOUT
-                )
-                if _retryable_status(response.status_code):
-                    response.raise_for_status()
-        response.raise_for_status()
+        service_operation_uid = str(uuid.uuid4())
+        with aef_custom_span(span_attributes={
+            "aef.kind": "service_call",
+            "aef.call_type": "api_call",
+            "aef.action": "pss.report",
+            "aef.target_name": "PALM.Security/PSS",
+            "aef.is_mutation": False,
+            "aef.rollback_possible": None,
+            "aef.trace_id": trace_id,
+            "aef.operation_uid": service_operation_uid,
+            "aef.parent_operation_uid": operation_uid or trace_id,
+            _TRACE_HEADER_NAME: trace_id,
+            "http.method": "POST",
+            "http.url": url,
+            "aef.request_payload": safe_trace_payload(body),
+        }) as span:
+            # 2. Отправляем (SECURITY §22: retry on 5xx/429/network)
+            for attempt in _http_retrying():
+                with attempt:
+                    record_hop(trace_id)
+                    response = httpx.post(
+                        url,
+                        json=body,
+                        headers=headers,
+                        timeout=TIMEOUT
+                    )
+                    safe_add_span_attributes(
+                        span,
+                        **{
+                            "http.status_code": response.status_code,
+                            "aef.hops_used": get_hops(trace_id),
+                        },
+                    )
+                    if _retryable_status(response.status_code):
+                        response.raise_for_status()
+            response.raise_for_status()
 
-        # 3. Валидируем ответ через общий PipelineResponse
-        payload = _decode_json_response(response, url=url, log_prefix="report")
-        try:
-            api_response = PipelineResponse(**payload)
-        except Exception as e:
-            _LOGGER.error(
-                "report_response_validation_failed. error=%s payload_summary=%s",
-                e,
-                _payload_summary(payload),
-            )
-            raise
+            # 3. Валидируем ответ через общий PipelineResponse
+            payload = _decode_json_response(response, url=url, log_prefix="report")
+            safe_add_span_attributes(span, **{"aef.response_payload": safe_trace_payload(_payload_summary(payload))})
+            safe_add_output_result(span, output=_payload_summary(payload))
+            try:
+                api_response = PipelineResponse(**payload)
+            except Exception as e:
+                _LOGGER.error(
+                    "report_response_validation_failed. error=%s payload_summary=%s",
+                    e,
+                    _payload_summary(payload),
+                )
+                safe_add_span_attributes(span, **{"aef.error_message": str(e)})
+                raise
         res = api_response.model_dump()
 
         _LOGGER.info(f"report_response. status = {res.get('status')}")

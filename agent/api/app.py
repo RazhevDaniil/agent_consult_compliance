@@ -19,9 +19,15 @@ from . import startup_checkup
 from .tracing import (
     aef_agent_start,
     aef_custom_span,
+    get_aef_callbacks,
     aef_input_request,
-    get_aef_handler,
+    get_hops,
     init_tracing,
+    record_hop,
+    reset_hops,
+    safe_add_output_result,
+    safe_add_span_attributes,
+    safe_trace_payload,
     session_id_cvar,
 )
 from .graph import compiled_graph, checkpointer
@@ -32,6 +38,7 @@ from .config import (
     ERROR_TEXT,
     TTL_EXCEEDED_TEXT,
     GIGAPLATFORM_REJECTED_TEXT,
+    TIMEOUT,
     DB_APP_URL,
     DB_APP_TIMEOUT_SEC,
     _TRACE_HEADER_NAME,
@@ -135,6 +142,7 @@ async def _ensure_incorrect_deals_report_cached(
         report_dt: str,
         auth_header: str | None = None,
         trace_id: str | None = None,
+        operation_uid: str | None = None,
 ) -> dict:
     """Cache lives in checkpointed state.generated_reports; auth comes
     from the request, not from any store."""
@@ -154,6 +162,7 @@ async def _ensure_incorrect_deals_report_cached(
         report_dt=report_dt,
         auth_header=auth_header,
         trace_id=trace_id,
+        operation_uid=operation_uid,
     )
     reports[cache_key] = result
     # as_node=START anchors the write on threads that haven't yet run
@@ -187,6 +196,7 @@ async def invoke_graph_single_turn(
         user_text: str,
         auth_header: str | None = None,
         trace_id: str | None = None,
+        operation_uid: str | None = None,
         callbacks: list | None = None,
 ) -> dict:
     """
@@ -204,6 +214,7 @@ async def invoke_graph_single_turn(
             "thread_id": chat_id,
             "auth_header": auth_header,
             "trace_id": trace_id,
+            "operation_uid": operation_uid,
         }
     }
     if callbacks:
@@ -321,23 +332,41 @@ async def _post_consultant_log(payload: dict) -> None:
     consultant_agent_log table) per SECURITY §20 (4).
     """
     trace_id = payload.get("trace_id")
+    operation_uid = payload.get("operation_uid") or payload.get("message_id")
     with aef_custom_span(span_attributes={
         "aef.kind": "other",
         "aef.action": "db_app.consultant_log",
+        "aef.call_type": "service_call",
         "aef.is_mutation": True,
         "aef.rollback_possible": False,
         "aef.trace_id": trace_id,
+        "aef.operation_uid": f"{operation_uid}:db_app" if operation_uid else None,
+        "aef.parent_operation_uid": operation_uid or trace_id,
         _TRACE_HEADER_NAME: trace_id,
-    }):
+        "aef.request_payload": safe_trace_payload(payload),
+    }) as span:
         try:
             json_payload = dict(payload)
             trace_id = json_payload.pop("trace_id", None)
+            json_payload.pop("operation_uid", None)
             headers = {_TRACE_HEADER_NAME: trace_id} if trace_id else {}
             async with httpx.AsyncClient(timeout=DB_APP_TIMEOUT_SEC) as client:
+                record_hop(trace_id)
                 resp = await client.post(
                     f"{DB_APP_URL}/v1/consultant-agent/logs",
                     json=json_payload,
                     headers=headers,
+                )
+                safe_add_span_attributes(
+                    span,
+                    **{
+                        "http.status_code": resp.status_code,
+                        "aef.hops_used": get_hops(trace_id),
+                        "aef.response_payload": safe_trace_payload({
+                            "status_code": resp.status_code,
+                            "body": resp.text[:500],
+                        }),
+                    },
                 )
                 if resp.status_code >= 400:
                     logger.warning(
@@ -346,6 +375,7 @@ async def _post_consultant_log(payload: dict) -> None:
                         resp.text[:500],
                     )
         except Exception as e:
+            safe_add_span_attributes(span, **{"aef.error_message": str(e)})
             logger.warning(f"consultant_log_post_failed: {e}")
 
 
@@ -383,6 +413,7 @@ async def chat_endpoint(
     # know about it, so we still generate one locally. SDK provides
     # `trace_id` for cross-span correlation; we drop the legacy `run_id`.
     message_id = str(uuid.uuid4())
+    operation_uid = message_id
     question_dttm = datetime.now(timezone.utc)
     user_id = (
         x_user_id
@@ -391,15 +422,21 @@ async def chat_endpoint(
     )
     source_system = x_source_system or getattr(request, "source_system", None) or "support"
     trace_id = _resolve_trace_id(x_trace_id)
+    reset_hops(trace_id)
     raw_response.headers[_TRACE_HEADER_NAME] = trace_id
 
     session_id_cvar.set(request.chat_id)
+    request_payload = request.model_dump(mode="json", exclude_none=True)
 
     input_body = {
         "chat_id": request.chat_id,
         "x_trace_id": trace_id,
+        "operation_uid": operation_uid,
+        "parent_operation_uid": trace_id,
         "message_len": len(request.message or ""),
         "source_system": source_system,
+        "request_payload": request_payload,
+        "executable_json": request_payload,
     }
 
     with aef_input_request(
@@ -411,14 +448,19 @@ async def chat_endpoint(
     ) as input_req:
         try:
             with aef_agent_start(input=input_body) as agent_span:
-                agent_span.add_span_attributes(**{
+                safe_add_span_attributes(agent_span, **{
                     "aef.agent_uid": settings.aef_agent_id,
                     "aef.session_id": request.chat_id,
                     "aef.trace_id": trace_id,
+                    "aef.operation_uid": operation_uid,
+                    "aef.parent_operation_uid": trace_id,
                     _TRACE_HEADER_NAME: trace_id,
                     "aef.ttl": settings.graph_timeout_sec,
-                    "aef.hops": None,
+                    "aef.hops": settings.agent_hops_limit,
+                    "aef.hops_limit": settings.agent_hops_limit,
+                    "aef.hops_used": 0,
                     "aef.stop_event": None,
+                    "aef.request_payload": safe_trace_payload(request_payload),
                 })
 
                 final_state = await invoke_graph_single_turn(
@@ -426,15 +468,16 @@ async def chat_endpoint(
                     user_text=request.message,
                     auth_header=authorization,
                     trace_id=trace_id,
-                    callbacks=[get_aef_handler()],
+                    operation_uid=operation_uid,
+                    callbacks=get_aef_callbacks(),
                 )
 
                 response_state = final_state.get("response_state", "completed")
                 stop_event = final_state.get("stop_event")
                 if stop_event:
-                    agent_span.add_span_attributes(**{"aef.stop_event": stop_event})
+                    safe_add_span_attributes(agent_span, **{"aef.stop_event": stop_event})
                 elif response_state == "failed":
-                    agent_span.add_span_attributes(**{"aef.stop_event": "phase_error"})
+                    safe_add_span_attributes(agent_span, **{"aef.stop_event": "phase_error"})
 
                 generated_report = final_state.get("generated_report") or {}
                 report_dt = generated_report.get("report_dt")
@@ -445,6 +488,7 @@ async def chat_endpoint(
                             report_dt,
                             auth_header=authorization,
                             trace_id=trace_id,
+                            operation_uid=operation_uid,
                         )
                     except Exception as e:
                         logger.warning(
@@ -457,10 +501,12 @@ async def chat_endpoint(
                 answer_text = final_state.get("answer", "Извините, произошла непредвиденная ошибка.")
                 destination = final_state.get("destination", "rag_methodology")
 
-                agent_span.add_output_result(output={
+                safe_add_span_attributes(agent_span, **{"aef.hops_used": get_hops(trace_id)})
+                safe_add_output_result(agent_span, output={
                     "destination": destination,
                     "response_state": response_state,
                     "answer_len": len(answer_text or ""),
+                    "hops_used": get_hops(trace_id),
                 })
 
             # Лог в db_app — в фоне, не блокирует ответ
@@ -469,6 +515,7 @@ async def chat_endpoint(
                 "session_id": request.chat_id,
                 "message_id": message_id,
                 "trace_id": trace_id,
+                "operation_uid": operation_uid,
                 "user_id": user_id,
                 "question": request.message,
                 "agent_branch": destination,
@@ -502,6 +549,7 @@ async def chat_endpoint(
                 "session_id": request.chat_id,
                 "message_id": message_id,
                 "trace_id": trace_id,
+                "operation_uid": operation_uid,
                 "user_id": user_id,
                 "question": request.message,
                 "agent_branch": "error",
@@ -521,22 +569,85 @@ async def chat_endpoint(
 @app.post("/api/kpk/incorrect-deals-report")
 async def incorrect_deals_report_endpoint(
         request: IncorrectDealsReportRequest,
+        raw_request: Request,
         raw_response: Response,
         authorization: Optional[str] = Header(default=None),
         x_trace_id: Optional[str] = Header(default=None, alias="x-trace-id"),
 ):
     trace_id = _resolve_trace_id(x_trace_id)
+    operation_uid = str(uuid.uuid4())
+    reset_hops(trace_id)
     raw_response.headers[_TRACE_HEADER_NAME] = trace_id
-    result = await _ensure_incorrect_deals_report_cached(
-        chat_id=request.chat_id,
-        report_dt=request.report_dt,
-        auth_header=authorization,
-        trace_id=trace_id,
-    )
-    if result.get("status") != "success":
-        raise HTTPException(status_code=502, detail=result.get("error") or ERROR_TEXT)
+    session_id_cvar.set(request.chat_id)
+    request_payload = request.model_dump(mode="json", exclude_none=True)
+    input_body = {
+        "chat_id": request.chat_id,
+        "x_trace_id": trace_id,
+        "operation_uid": operation_uid,
+        "parent_operation_uid": trace_id,
+        "request_payload": request_payload,
+        "executable_json": request_payload,
+    }
 
-    filename = result.get("filename") or f"new_deals_report_{request.report_dt.replace('-', '')}.xlsx"
+    with aef_input_request(
+        span_name="kpk_incorrect_deals_report",
+        headers=dict(raw_request.headers),
+        body=input_body,
+        path="/api/kpk/incorrect-deals-report",
+        method="POST",
+    ) as input_req:
+        with aef_agent_start(input=input_body) as agent_span:
+            safe_add_span_attributes(agent_span, **{
+                "aef.agent_uid": settings.aef_agent_id,
+                "aef.session_id": request.chat_id,
+                "aef.trace_id": trace_id,
+                "aef.operation_uid": operation_uid,
+                "aef.parent_operation_uid": trace_id,
+                _TRACE_HEADER_NAME: trace_id,
+                "aef.ttl": TIMEOUT,
+                "aef.hops": settings.agent_hops_limit,
+                "aef.hops_limit": settings.agent_hops_limit,
+                "aef.hops_used": 0,
+                "aef.stop_event": None,
+                "aef.request_payload": safe_trace_payload(request_payload),
+            })
+            result = await _ensure_incorrect_deals_report_cached(
+                chat_id=request.chat_id,
+                report_dt=request.report_dt,
+                auth_header=authorization,
+                trace_id=trace_id,
+                operation_uid=operation_uid,
+            )
+            safe_add_span_attributes(agent_span, **{"aef.hops_used": get_hops(trace_id)})
+            if result.get("status") != "success":
+                body = {"error": result.get("error") or ERROR_TEXT}
+                input_req.add_response(
+                    headers={_TRACE_HEADER_NAME: trace_id},
+                    body=body,
+                    http_code=502,
+                )
+                safe_add_output_result(agent_span, output={
+                    "response_state": "failed",
+                    "hops_used": get_hops(trace_id),
+                    **body,
+                })
+                raise HTTPException(status_code=502, detail=body["error"])
+
+            filename = result.get("filename") or f"new_deals_report_{request.report_dt.replace('-', '')}.xlsx"
+            response_meta = {
+                "status": "success",
+                "filename": filename,
+                "media_type": result.get("media_type"),
+                "content_len": len(result.get("content") or b""),
+                "hops_used": get_hops(trace_id),
+            }
+            safe_add_output_result(agent_span, output=response_meta)
+            input_req.add_response(
+                headers={_TRACE_HEADER_NAME: trace_id},
+                body=response_meta,
+                http_code=200,
+            )
+
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     headers[_TRACE_HEADER_NAME] = trace_id
     return Response(
@@ -598,22 +709,77 @@ async def get_chat_history(chat_id: str):
 
 
 @app.post("/chat/{chat_id}/reset")
-async def reset_chat(chat_id: str):
+async def reset_chat(
+    chat_id: str,
+    raw_request: Request,
+    raw_response: Response,
+    x_trace_id: Optional[str] = Header(default=None, alias="x-trace-id"),
+):
     # Clear the entire checkpointed slice for this thread. For `messages`
     # we pipe through the add_messages reducer using a single tombstone
     # `RemoveMessage(id=REMOVE_ALL_MESSAGES)`, which clears the list.
-    config = {"configurable": {"thread_id": chat_id}}
-    await compiled_graph.aupdate_state(
-        config,
-        {
-            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
-            "last_tool_payload": None,
-            "last_tool_kind": None,
-            "last_selector": None,
-            "generated_reports": {},
-            "tool_cache": {},
-            "pending_kpk_date_choice": None,
-        },
-        as_node=START,
-    )
-    return {"status": "success", "message": "Chat history reset"}
+    trace_id = _resolve_trace_id(x_trace_id)
+    operation_uid = str(uuid.uuid4())
+    raw_response.headers[_TRACE_HEADER_NAME] = trace_id
+    session_id_cvar.set(chat_id)
+    input_body = {
+        "chat_id": chat_id,
+        "x_trace_id": trace_id,
+        "operation_uid": operation_uid,
+        "parent_operation_uid": trace_id,
+        "request_payload": {"chat_id": chat_id},
+        "executable_json": {"chat_id": chat_id},
+    }
+
+    with aef_input_request(
+        span_name="chat_reset",
+        headers=dict(raw_request.headers),
+        body=input_body,
+        path=f"/chat/{chat_id}/reset",
+        method="POST",
+    ) as input_req:
+        with aef_agent_start(input=input_body) as agent_span:
+            safe_add_span_attributes(agent_span, **{
+                "aef.agent_uid": settings.aef_agent_id,
+                "aef.session_id": chat_id,
+                "aef.trace_id": trace_id,
+                "aef.operation_uid": operation_uid,
+                "aef.parent_operation_uid": trace_id,
+                _TRACE_HEADER_NAME: trace_id,
+                "aef.ttl": settings.graph_timeout_sec,
+                "aef.hops": 0,
+                "aef.hops_limit": 0,
+                "aef.hops_used": 0,
+                "aef.stop_event": None,
+                "aef.request_payload": safe_trace_payload(input_body["request_payload"]),
+            })
+            with aef_custom_span(span_attributes={
+                "aef.kind": "other",
+                "aef.action": "chat.reset_state",
+                "aef.call_type": "action",
+                "aef.is_mutation": True,
+                "aef.rollback_possible": False,
+                "aef.trace_id": trace_id,
+                "aef.operation_uid": f"{operation_uid}:reset_state",
+                "aef.parent_operation_uid": operation_uid,
+                _TRACE_HEADER_NAME: trace_id,
+            }) as reset_span:
+                config = {"configurable": {"thread_id": chat_id}}
+                await compiled_graph.aupdate_state(
+                    config,
+                    {
+                        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
+                        "last_tool_payload": None,
+                        "last_tool_kind": None,
+                        "last_selector": None,
+                        "generated_reports": {},
+                        "tool_cache": {},
+                        "pending_kpk_date_choice": None,
+                    },
+                    as_node=START,
+                )
+                safe_add_output_result(reset_span, output={"status": "success"})
+            body = {"status": "success", "message": "Chat history reset"}
+            safe_add_output_result(agent_span, output=body)
+            input_req.add_response(headers={_TRACE_HEADER_NAME: trace_id}, body=body, http_code=200)
+            return body
