@@ -29,6 +29,7 @@ from .tracing import (
     safe_add_span_attributes,
     safe_trace_payload,
     session_id_cvar,
+    trace_operation_context,
 )
 from .graph import compiled_graph, checkpointer
 from .models import ChatRequest, ChatResponse, IncorrectDealsReportRequest
@@ -222,18 +223,19 @@ async def invoke_graph_single_turn(
         config["callbacks"] = callbacks
 
     try:
-        final_state = await asyncio.wait_for(
-            compiled_graph.ainvoke(
-                {
-                    "input": user_input,
-                    "messages": [HumanMessage(content=user_input)],
-                    "regen_attempts": 0,
-                    "is_context_identical": False,
-                },
-                config=config,
-            ),
-            timeout=settings.graph_timeout_sec,
-        )
+        with trace_operation_context(trace_id=trace_id, operation_uid=operation_uid):
+            final_state = await asyncio.wait_for(
+                compiled_graph.ainvoke(
+                    {
+                        "input": user_input,
+                        "messages": [HumanMessage(content=user_input)],
+                        "regen_attempts": 0,
+                        "is_context_identical": False,
+                    },
+                    config=config,
+                ),
+                timeout=settings.graph_timeout_sec,
+            )
     except asyncio.TimeoutError:
         logger.error(f"graph_timeout_exceeded: {chat_id}")
         return {

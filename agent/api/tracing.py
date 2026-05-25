@@ -57,6 +57,8 @@ _HANDLER: Any | None = None
 _TRACING_DISABLED = _AEF_IMPORT_ERROR is not None
 _HOP_COUNTS: dict[str, int] = {}
 _HOP_LOCK = threading.Lock()
+_CURRENT_TRACE_ID: ContextVar[str | None] = ContextVar("aef_current_trace_id", default=None)
+_CURRENT_OPERATION_UID: ContextVar[str | None] = ContextVar("aef_current_operation_uid", default=None)
 
 
 def reset_hops(trace_id: str | None) -> None:
@@ -79,6 +81,25 @@ def get_hops(trace_id: str | None) -> int:
         return 0
     with _HOP_LOCK:
         return _HOP_COUNTS.get(trace_id, 0)
+
+
+def current_trace_id() -> str | None:
+    return _CURRENT_TRACE_ID.get()
+
+
+def current_operation_uid() -> str | None:
+    return _CURRENT_OPERATION_UID.get()
+
+
+@contextmanager
+def trace_operation_context(trace_id: str | None = None, operation_uid: str | None = None):
+    trace_token = _CURRENT_TRACE_ID.set(trace_id)
+    operation_token = _CURRENT_OPERATION_UID.set(operation_uid)
+    try:
+        yield
+    finally:
+        _CURRENT_OPERATION_UID.reset(operation_token)
+        _CURRENT_TRACE_ID.reset(trace_token)
 
 
 def safe_trace_payload(value: Any, max_chars: int | None = None) -> Any:
@@ -245,6 +266,8 @@ def init_tracing() -> Any | None:
         )
         _HANDLER = AEFHandler(tracer=provider.get_tracer(__name__))
         _TRACING_DISABLED = False
+        if not settings.aef_langchain_callbacks_enabled:
+            logger.info("AEF LangChain callbacks disabled; manual AEF spans remain active")
         logger.info("AEF Tracing initialized successfully")
         return _HANDLER
     except Exception as e:
@@ -259,6 +282,8 @@ def get_aef_handler() -> Any | None:
 
 
 def get_aef_callbacks() -> list[Any]:
+    if not settings.aef_langchain_callbacks_enabled:
+        return []
     return [_HANDLER] if _HANDLER is not None else []
 
 
@@ -276,6 +301,9 @@ __all__ = [
     "reset_hops",
     "record_hop",
     "get_hops",
+    "current_trace_id",
+    "current_operation_uid",
+    "trace_operation_context",
     "safe_trace_payload",
     "safe_add_span_attributes",
     "safe_add_output_result",

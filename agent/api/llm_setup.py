@@ -50,9 +50,9 @@ def _pick(main: str, preview: Optional[str]) -> tuple[str, str]:
 def _build(main: str, preview: Optional[str], temperature: float, timeout: int, max_tokens: int) -> GigaChat:
     """Per-call model pick + GigaChat construction.
 
-    AEF callbacks are attached once at graph invocation level in app.py. Do
-    not attach them here too: nested callbacks can conflict across async and
-    threadpool boundaries.
+    AEF spans for LLM calls are emitted by graph_llm_wrappers around the shared
+    retry wrapper. Do not attach callbacks here: nested callbacks can conflict
+    across async and threadpool boundaries.
     """
     model, installation = _pick(main, preview)
     _LOGGER.info(f"gigachat_installation_picked. installation: {installation}. model: {model}")

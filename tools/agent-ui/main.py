@@ -588,8 +588,7 @@ def call_agent_api(loading_flag, session_data):
     jwt_token = get_request_jwt_token()
 
     if not jwt_token:
-        msg = 'JWT token is missing'
-        logger.exception(msg)
+        logger.warning("JWT token is missing while sending message to agent")
 
     trace_id = str(uuid.uuid4())
     logger.info("try to send message to agent with jwt_token trace_id=%s", trace_id)

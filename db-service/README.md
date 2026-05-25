@@ -250,7 +250,7 @@ Snapshot одного расчёта ставки с полным набором
 
 ### Приём идентификаторов
 
-HTTP-мидлвара [main.py:30-46](main.py#L30) (`trace_context_middleware`) читает из входящих запросов `X-Run-Id` и `X-Thread-Id`, биндит в `structlog.contextvars`, чистит на выходе. `merge_contextvars` подключён в [app/logging_config.py](app/logging_config.py) — все события `db_app` под одним запросом автоматически получают `run_id`/`thread_id` в JSON-логе.
+HTTP-мидлвара [main.py:30-46](main.py#L30) (`trace_context_middleware`) читает из входящих запросов `x-trace-id`, валидирует его как UUID v4, при отсутствии/ошибке генерирует новый и возвращает его в response headers. UID биндится в `structlog.contextvars` как `trace_id`; legacy `X-Run-Id` / `X-Thread-Id` по-прежнему подмешиваются в логи, если пришли. `merge_contextvars` подключён в [app/logging_config.py](app/logging_config.py) — события `db_app` под одним запросом автоматически получают эти поля в JSON-логе.
 
 ### Персистенция
 

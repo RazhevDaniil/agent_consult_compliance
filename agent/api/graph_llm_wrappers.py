@@ -4,9 +4,10 @@ import json
 import httpx
 import requests
 import logging
+import uuid
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 from langchain_core.documents import Document
 from tenacity import (
@@ -22,6 +23,15 @@ _LOGGER = logging.getLogger(__name__)
 audit = logging.getLogger('aif_audit')
 
 from .config import settings
+from .tracing import (
+    aef_custom_span,
+    current_operation_uid,
+    current_trace_id,
+    get_hops,
+    record_hop,
+    safe_add_span_attributes,
+    safe_trace_payload,
+)
 
 GIGAPLATFORM_STOP_EVENT = "gigaplatform_rejected"
 GIGAPLATFORM_UNAVAILABLE_MESSAGE = "The service is temporarily unavailable due to technical reasons."
@@ -166,17 +176,96 @@ from .llm_setup import utility_llm
 from .kpk_models import KpkLimitParsedQuery
 
 
+def _runnable_name(runnable) -> str:
+    return (
+        getattr(runnable, "model", None)
+        or getattr(runnable, "model_name", None)
+        or runnable.__class__.__name__
+    )
+
+
+def _llm_payload_summary(payload: Any) -> Any:
+    if isinstance(payload, str):
+        return {"type": "str", "text_len": len(payload), "text_preview": payload[:500]}
+    return safe_trace_payload(payload, max_chars=2000)
+
+
+def _llm_response_summary(result: Any) -> dict[str, Any]:
+    content = getattr(result, "content", None)
+    if content is None:
+        content = "" if result is None else str(result)
+    return {
+        "type": result.__class__.__name__ if result is not None else "None",
+        "content_len": len(str(content)),
+    }
+
+
+def _llm_span_attrs(runnable, payload, *, node_name: str) -> dict[str, Any]:
+    trace_id = current_trace_id()
+    operation_uid = current_operation_uid()
+    return {
+        "aef.kind": "service_call",
+        "aef.call_type": "llm_call",
+        "aef.action": f"llm.{node_name}",
+        "aef.target_name": _runnable_name(runnable),
+        "aef.is_mutation": False,
+        "aef.rollback_possible": None,
+        "aef.trace_id": trace_id,
+        "aef.operation_uid": str(uuid.uuid4()),
+        "aef.parent_operation_uid": operation_uid or trace_id,
+        "aef.request_payload": _llm_payload_summary(payload),
+    }
+
+
+def _invoke_once_with_aef(runnable, payload, *, node_name: str):
+    trace_id = current_trace_id()
+    with aef_custom_span(span_attributes=_llm_span_attrs(runnable, payload, node_name=node_name)) as span:
+        record_hop(trace_id)
+        try:
+            result = runnable.invoke(payload)
+        except Exception as e:
+            safe_add_span_attributes(span, **{
+                "aef.error_message": str(e),
+                "aef.hops_used": get_hops(trace_id),
+            })
+            raise
+        safe_add_span_attributes(span, **{
+            "aef.response_payload": _llm_response_summary(result),
+            "aef.hops_used": get_hops(trace_id),
+        })
+        return result
+
+
+async def _ainvoke_once_with_aef(runnable, payload, *, node_name: str):
+    trace_id = current_trace_id()
+    with aef_custom_span(span_attributes=_llm_span_attrs(runnable, payload, node_name=node_name)) as span:
+        record_hop(trace_id)
+        try:
+            result = await runnable.ainvoke(payload)
+        except Exception as e:
+            safe_add_span_attributes(span, **{
+                "aef.error_message": str(e),
+                "aef.hops_used": get_hops(trace_id),
+            })
+            raise
+        safe_add_span_attributes(span, **{
+            "aef.response_payload": _llm_response_summary(result),
+            "aef.hops_used": get_hops(trace_id),
+        })
+        return result
+
+
 def _invoke_with_retry(runnable, payload, *, node_name: str):
     for attempt in _llm_retrying_sync():
         with attempt:
-            return runnable.invoke(payload)
+            return _invoke_once_with_aef(runnable, payload, node_name=node_name)
     raise RuntimeError(f"{node_name} LLM retry loop did not execute")
 
 
 async def _ainvoke_with_retry(runnable, payload, *, node_name: str):
     async for attempt in _llm_retrying_async():
         with attempt:
-            return await runnable.ainvoke(payload)
+            return await _ainvoke_once_with_aef(runnable, payload, node_name=node_name)
     raise RuntimeError(f"{node_name} LLM retry loop did not execute")
 
 

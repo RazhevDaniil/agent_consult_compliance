@@ -47,6 +47,7 @@ async def trace_context_middleware(request: Request, call_next):
     the upstream operation."""
     bound: dict[str, str] = {}
     trace_id, missing, invalid = _resolve_trace_id(request.headers.get(TRACE_HEADER_NAME))
+    request.state.trace_id = trace_id
     bound["trace_id"] = trace_id
     if run_id := request.headers.get("X-Run-Id"):
         bound["run_id"] = run_id

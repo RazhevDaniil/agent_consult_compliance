@@ -622,18 +622,15 @@ def _mentions_this_deal(text: str) -> bool:
 def _trace_node(name: str, **fields):
     """Structured node-trace: start/done with duration_ms, failed on exception.
 
-    Это **структурированный лог-обвес**, а не AEF span. Парный span типа
-    `chain` для каждого узла графа автоматически собирает `AEFHandler` через
-    `compiled_graph.ainvoke(config={"callbacks": [...]})`. `_trace_node`
-    оставлен для out-of-band аудита через structlog: пишет `node_start` /
-    `node_done` / `node_failed` с `duration_ms` в общий лог-стрим (Loki /
-    OpenSearch), не пересекаясь с трейсами в AEF Manager.
+    Это **структурированный лог-обвес**, а не AEF span. `_trace_node` оставлен
+    для out-of-band аудита через structlog: пишет `node_start` / `node_done` /
+    `node_failed` с `duration_ms` в общий лог-стрим (Loki / OpenSearch), не
+    пересекаясь с трейсами в AEF Manager.
 
     Используется на узлах с локальной логикой (parse / preprocess / finalize
     / generate / router). На узлах, сводящихся к внешнему HTTP-вызову
     (execute_tool, kpk_tool, deals_report), отдельный `_trace_node` не
-    добавляется — нагрузку покрывает `output_request` span от
-    OpenTelemetry httpx/requests instrumenting.
+    добавляется — нагрузку покрывают ручные `aef_custom_span` в HTTP-клиентах.
     """
     t0 = time.perf_counter()
     _LOGGER.info("node_start")

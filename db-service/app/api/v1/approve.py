@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from ...api.v1.schemas import (
     ApproveDealSnapshotIn,
@@ -17,6 +17,10 @@ log = get_logger("app.api.approve")
 router = APIRouter(prefix="/approve", tags=["approve"])
 
 
+def _request_trace_id(request: Request, explicit: str | None = None) -> str | None:
+    return explicit or getattr(request.state, "trace_id", None)
+
+
 # ─── Snapshots ───────────────────────────────────────────────────────────────
 
 
@@ -24,11 +28,20 @@ router = APIRouter(prefix="/approve", tags=["approve"])
 async def create_snapshot(
     body: ApproveDealSnapshotIn,
     session: SessionDep,
+    request: Request,
 ) -> ApproveDealSnapshotOut:
     """Create a rate calculation snapshot bound to an existing approve_task."""
-    log.info("create_snapshot.start", calc_id=body.calc_id, task_id=body.task_id)
+    run_id = _request_trace_id(request, body.run_id)
+    log.info(
+        "create_snapshot.start",
+        calc_id=body.calc_id,
+        task_id=body.task_id,
+        run_id=run_id,
+    )
     repo = ApproveSnapshotRepo(session)
-    snapshot, created = await repo.create(**body.model_dump())
+    values = body.model_dump()
+    values["run_id"] = run_id
+    snapshot, created = await repo.create(**values)
     await session.commit()
     log.info("create_snapshot.done", calc_id=snapshot.calc_id, created=created)
     return ApproveDealSnapshotOut.model_validate(snapshot)
@@ -58,15 +71,20 @@ async def get_snapshot_by_task(
 async def create_task(
     body: ApproveTaskIn,
     session: SessionDep,
+    request: Request,
 ) -> ApproveTaskOut:
     """Create an approval task. Idempotent on task_id."""
+    run_id = _request_trace_id(request, body.run_id)
     log.info(
         "create_task.start",
         task_id=body.task_id,
         calculation_id=body.calculation_id,
+        run_id=run_id,
     )
     repo = ApproveTaskRepo(session)
-    task, created = await repo.create(**body.model_dump())
+    values = body.model_dump()
+    values["run_id"] = run_id
+    task, created = await repo.create(**values)
     await session.commit()
     log.info("create_task.done", task_id=task.task_id, created=created)
     return ApproveTaskOut.model_validate(task)
@@ -134,14 +152,17 @@ async def update_task_status(
     task_id: str,
     body: UpdateApproveTaskIn,
     session: SessionDep,
+    request: Request,
 ) -> ApproveTaskOut:
     """Update task status, attempt counter, agent answer and error message."""
+    run_id = _request_trace_id(request, body.run_id)
     log.info(
         "update_task_status.start",
         task_id=task_id,
         task_status=body.task_status,
         deal_status=body.deal_status,
         attempt_count=body.attempt_count,
+        run_id=run_id,
     )
     repo = ApproveTaskRepo(session)
     task = await repo.update_status(
@@ -151,7 +172,7 @@ async def update_task_status(
         agent_answer=body.agent_answer,
         attempt_count=body.attempt_count,
         error_message=body.error_message,
-        run_id=body.run_id,
+        run_id=run_id,
     )
     if task is None:
         log.warning("update_task_status.not_found", task_id=task_id)

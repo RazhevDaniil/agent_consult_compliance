@@ -51,6 +51,7 @@ from .agent_treasury_api.client_processes.client_service import ClientDataServic
 
 PREFIX_TAIL = os.getenv('PREFIX_TAIL', '')
 TRACE_HEADER_NAME = "x-trace-id"
+PROBE_PATHS = {"/health", "/ready"}
 
 DATA_PROCESSOR_TZ = ZoneInfo(os.getenv("DATA_PROCESSOR_TZ", "Europe/Moscow"))
 DATA_PROCESSOR_HOUR = int(os.getenv("DATA_PROCESSOR_HOUR", "4"))
@@ -71,6 +72,10 @@ def _resolve_trace_id(value: str | None) -> tuple[str, bool, bool]:
     if parsed.version != 4:
         return str(uuid.uuid4()), False, True
     return str(parsed), False, False
+
+
+def _is_probe_path(path: str) -> bool:
+    return path.rstrip("/") in PROBE_PATHS
 
 
 def _enrich_deals_with_client_names(data: dict | None) -> None:
@@ -181,26 +186,29 @@ log.info("--- AGENT-TOOLS Service has just been initialized ---")
 async def trace_context_middleware(request: Request, call_next):
     trace_id, missing, invalid = _resolve_trace_id(request.headers.get(TRACE_HEADER_NAME))
     request.state.trace_id = trace_id
+    is_probe = _is_probe_path(request.url.path)
 
     if missing or invalid:
-        log.warning(
+        log_fn = log.debug if missing and is_probe else log.warning
+        log_fn(
             "trace_id_generated trace_id=%s missing=%s invalid=%s path=%s",
             trace_id,
             missing,
             invalid,
             request.url.path,
         )
-    else:
+    elif not is_probe:
         log.info("request_received trace_id=%s path=%s", trace_id, request.url.path)
 
     response = await call_next(request)
     response.headers[TRACE_HEADER_NAME] = trace_id
-    log.info(
-        "request_finished trace_id=%s path=%s status_code=%s",
-        trace_id,
-        request.url.path,
-        response.status_code,
-    )
+    if not is_probe:
+        log.info(
+            "request_finished trace_id=%s path=%s status_code=%s",
+            trace_id,
+            request.url.path,
+            response.status_code,
+        )
     return response
 
 SECRETS_PROPS = Path("/vault/secrets/secrets.properties")

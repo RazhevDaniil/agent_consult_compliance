@@ -145,6 +145,10 @@ class AppSettings(BaseSettings):
         default="prototype-distributive1",
         validation_alias=AliasChoices("DISTRIBUTIVE", "AEF_DISTRIBUTIVE"),
     )
+    aef_langchain_callbacks_enabled: bool = Field(
+        default=False,
+        validation_alias="AEF_LANGCHAIN_CALLBACKS_ENABLED",
+    )
 
     # Compiled regex — not config, not env-loadable. ClassVar tells pydantic
     # to skip it as a settings field; `settings.latex_pattern` still resolves.

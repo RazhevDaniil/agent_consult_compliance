@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...api.v1.schemas import (
@@ -20,6 +20,18 @@ from ...repositories.thread_repo import ThreadRepo
 log = get_logger("app.api.messages")
 
 router = APIRouter(prefix="/messages", tags=["messages"])
+TRACE_HEADER_NAME = "x-trace-id"
+
+
+def _request_trace_id(request: Request, explicit: str | None = None) -> str | None:
+    return explicit or getattr(request.state, "trace_id", None)
+
+
+def _headers_with_trace(headers_json: dict | None, trace_id: str | None) -> dict | None:
+    headers = dict(headers_json or {})
+    if trace_id:
+        headers[TRACE_HEADER_NAME] = trace_id
+    return headers or None
 
 
 def _make_thread_repo(session: AsyncSession) -> ThreadRepo:
@@ -38,14 +50,18 @@ def _make_outbox_repo(session: AsyncSession) -> OutboxRepo:
 async def ingest_message(
     body: IngestMessageIn,
     session: SessionDep,
+    request: Request,
 ) -> IngestOut:
     """Save an incoming email and atomically enqueue a PROCESS_INCOMING task."""
+    run_id = _request_trace_id(request, body.run_id)
+    headers_json = _headers_with_trace(body.headers_json, run_id)
     log.info(
         "ingest.start",
         message_id=body.message_id,
         thread_id=body.thread_id,
         author_email=body.author_email,
         task_key=body.task_key,
+        run_id=run_id,
     )
     thread_repo = _make_thread_repo(session)
     message_repo = _make_message_repo(session)
@@ -67,8 +83,8 @@ async def ingest_message(
         author_email=body.author_email,
         body_text=body.body_text,
         body_html=body.body_html,
-        headers_json=body.headers_json,
-        run_id=body.run_id,
+        headers_json=headers_json,
+        run_id=run_id,
     )
     log.debug(
         "ingest.message_resolved",
@@ -84,14 +100,15 @@ async def ingest_message(
         "reply_to_email": body.reply_to_email,
         "subject": body.subject,
         "body": body.body_text or body.body_html or "",
-        "run_id": body.run_id,
+        "x_trace_id": run_id,
+        "run_id": run_id,
     }
     task, task_created = await outbox_repo.create(
         task_type="PROCESS_INCOMING",
         task_key=body.task_key,
         email_id=message.message_id,
         payload_json=process_payload,
-        run_id=body.run_id,
+        run_id=run_id,
     )
     log.debug(
         "ingest.task_resolved",
@@ -121,14 +138,18 @@ async def ingest_message(
 async def save_outgoing_message(
     body: OutgoingMessageIn,
     session: SessionDep,
+    request: Request,
 ) -> OutgoingOut:
     """Save an outgoing email and atomically enqueue a SEND_SMTP task."""
+    run_id = _request_trace_id(request, body.run_id)
+    headers_json = _headers_with_trace(body.headers_json, run_id)
     log.info(
         "outgoing.start",
         message_id=body.message_id,
         thread_id=body.thread_id,
         author_email=body.author_email,
         task_key=body.task_key,
+        run_id=run_id,
     )
     thread_repo = _make_thread_repo(session)
     message_repo = _make_message_repo(session)
@@ -150,8 +171,8 @@ async def save_outgoing_message(
         author_email=body.author_email,
         body_text=body.body_text,
         body_html=body.body_html,
-        headers_json=body.headers_json,
-        run_id=body.run_id,
+        headers_json=headers_json,
+        run_id=run_id,
     )
     log.debug(
         "outgoing.message_resolved",
@@ -162,14 +183,15 @@ async def save_outgoing_message(
     payload = dict(body.smtp_payload or {})
     # Если caller передал run_id явным полем, а в smtp_payload его нет —
     # подмешиваем, чтобы SMTP-воркер мог восстановить контекст без двух источников правды.
-    if body.run_id and "run_id" not in payload:
-        payload["run_id"] = body.run_id
+    if run_id:
+        payload.setdefault("run_id", run_id)
+        payload.setdefault("x_trace_id", run_id)
     task, task_created = await outbox_repo.create(
         task_type="SEND_SMTP",
         task_key=body.task_key,
         email_id=message.message_id,
         payload_json=payload or None,
-        run_id=body.run_id,
+        run_id=run_id,
     )
     log.debug(
         "outgoing.task_resolved",

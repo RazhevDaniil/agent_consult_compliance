@@ -18,6 +18,13 @@ app:
       - httpx
       - aiohttp
       - aiokafka
+      - opentelemetry-api
+      - opentelemetry-sdk
+      - opentelemetry-instrumentation
+      - opentelemetry-instrumentation-httpx
+      - opentelemetry-instrumentation-requests
+      - opentelemetry-instrumentation-aiohttp-client
+      - opentelemetry-instrumentation-aiokafka
 
   connections:
     endpoints:

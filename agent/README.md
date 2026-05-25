@@ -60,13 +60,13 @@ per-request через `RunnableConfig.configurable`, не сохраняетс�
 **Что эмитится в трейс:**
 
 - **`input_request "chat"`** + вложенный **`agent_start`** — обёртка `/chat` в [api/app.py](api/app.py). На `agent_start` спане проставлены `aef.agent_uid`, `aef.ttl`, `aef.hops`, `aef.stop_event`, `aef.session_id` (§21).
-- **`chain` / `llm` / `retriever`** — автоматически через `AEFHandler` callback, передаваемый в `compiled_graph.ainvoke(config={"callbacks": [...]})` через [`invoke_graph_single_turn(callbacks=[get_aef_handler()])`](api/app.py). FAISS retriever, GigaChat invocations и узлы графа покрываются автоматически.
-- **`output_request`** — автоматически через OpenTelemetry instrumenting на httpx (фоновый POST в `db_app/consultant-agent/logs`) и на requests для PSS `agent-tools` / КПК API в [api/tools.py](api/tools.py) / [api/kpk_tools.py](api/kpk_tools.py).
+- **`llm`** — ручные `aef_custom_span` вокруг общего LLM retry-wrapper в [api/graph_llm_wrappers.py](api/graph_llm_wrappers.py). LangChain `AEFHandler` callbacks выключены по умолчанию (`AEF_LANGCHAIN_CALLBACKS_ENABLED=false`), чтобы не ловить OpenTelemetry `Token was created in a different Context` на async callback end-событиях.
+- **`output_request` / `api_call`** — ручные `aef_custom_span` на фоновый POST в `db_app/consultant-agent/logs` и на PSS `agent-tools` / КПК API в [api/app.py](api/app.py), [api/tools.py](api/tools.py) и [api/kpk_tools.py](api/kpk_tools.py).
 - **`aef.is_mutation` / `aef.rollback_possible`** — на `aef_custom_span` обёртке фонового `db_app.consultant_log` POST (запись в `consultant_agent_log` — мутация без отката).
 
 **StopEvent (§21).** При TTL `asyncio.wait_for(timeout=settings.graph_timeout_sec)` на `agent_start` проставляется `aef.stop_event="ttl_exceeded"`; при `phase="error"` от графа — `"phase_error"`.
 
-**PreView GigaChat (§26).** `_pick(main, preview)` в [api/llm_setup.py](api/llm_setup.py) per-call выбирает Main или PreView; на каждом свежем `GigaChat(...)` подвешен `callbacks=[get_aef_handler()]` — SDK собирает `llm` span с фактической `model`. Выбор дополнительно логируется в structlog (`event=gigachat_installation_picked`).
+**PreView GigaChat (§26).** `_pick(main, preview)` в [api/llm_setup.py](api/llm_setup.py) per-call выбирает Main или PreView; фактический LLM-вызов покрывается ручным `aef_custom_span` в общем retry-wrapper, а выбор инсталляции дополнительно логируется в structlog (`event=gigachat_installation_picked`).
 
 Узлы графа дополнительно покрыты `_trace_node` ([api/tech_funcs.py](api/tech_funcs.py)) — на каждый узел пара `node_start` / `node_done` в stdout-логах. Это **дополнительный** structlog-аудит поверх SDK `chain`-спанов, не дубль; имена событий стабильны для существующих дашбордов FluentBit.
 

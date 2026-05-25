@@ -29,6 +29,7 @@ from .tracing import (
     safe_add_output_result,
     safe_add_span_attributes,
     session_id_cvar,
+    trace_operation_context,
 )
 
 
@@ -83,19 +84,20 @@ async def _check_gigachat() -> None:
                 "aef.hops_used": 1,
                 "aef.stop_event": None,
             })
-            llm = utility_llm()
-            callbacks = get_aef_callbacks()
-            if callbacks:
-                llm = llm.with_config({"callbacks": callbacks})
-            content = await asyncio.wait_for(
-                _ainvoke_text_with_default(
-                    llm,
-                    "Ответь одним словом: OK",
-                    default_text="",
-                    node_name="readiness_gigachat",
-                ),
-                timeout=settings.readiness_gigachat_timeout_sec,
-            )
+            with trace_operation_context(trace_id=trace_id, operation_uid=operation_uid):
+                llm = utility_llm()
+                callbacks = get_aef_callbacks()
+                if callbacks:
+                    llm = llm.with_config({"callbacks": callbacks})
+                content = await asyncio.wait_for(
+                    _ainvoke_text_with_default(
+                        llm,
+                        "Ответь одним словом: OK",
+                        default_text="",
+                        node_name="readiness_gigachat",
+                    ),
+                    timeout=settings.readiness_gigachat_timeout_sec,
+                )
             if not str(content).strip():
                 raise RuntimeError("gigachat returned empty content")
             result_body = {"status": "ok", "content_len": len(str(content))}
@@ -156,18 +158,19 @@ async def _check_rag() -> None:
                 callbacks = get_aef_callbacks()
                 if callbacks:
                     config["callbacks"] = callbacks
-                state = await asyncio.wait_for(
-                    compiled_graph.ainvoke(
-                        {
-                            "input": q,
-                            "messages": [HumanMessage(content=q)],
-                            "regen_attempts": 0,
-                            "is_context_identical": False,
-                        },
-                        config=config,
-                    ),
-                    timeout=settings.readiness_rag_timeout_sec,
-                )
+                with trace_operation_context(trace_id=trace_id, operation_uid=operation_uid):
+                    state = await asyncio.wait_for(
+                        compiled_graph.ainvoke(
+                            {
+                                "input": q,
+                                "messages": [HumanMessage(content=q)],
+                                "regen_attempts": 0,
+                                "is_context_identical": False,
+                            },
+                            config=config,
+                        ),
+                        timeout=settings.readiness_rag_timeout_sec,
+                    )
                 final = (state.get("final_answer") or state.get("answer") or "").strip()
                 sources = state.get("sources") or []
                 if not final:
@@ -225,18 +228,19 @@ async def _check_missing_data() -> None:
             callbacks = get_aef_callbacks()
             if callbacks:
                 config["callbacks"] = callbacks
-            state = await asyncio.wait_for(
-                compiled_graph.ainvoke(
-                    {
-                        "input": "Посчитай pricing",
-                        "messages": [HumanMessage(content="Посчитай pricing")],
-                        "regen_attempts": 0,
-                        "is_context_identical": False,
-                    },
-                    config=config,
-                ),
-                timeout=settings.readiness_missing_data_timeout_sec,
-            )
+            with trace_operation_context(trace_id=trace_id, operation_uid=operation_uid):
+                state = await asyncio.wait_for(
+                    compiled_graph.ainvoke(
+                        {
+                            "input": "Посчитай pricing",
+                            "messages": [HumanMessage(content="Посчитай pricing")],
+                            "regen_attempts": 0,
+                            "is_context_identical": False,
+                        },
+                        config=config,
+                    ),
+                    timeout=settings.readiness_missing_data_timeout_sec,
+                )
             final = (state.get("final_answer") or state.get("answer") or "").strip()
             if not final:
                 raise RuntimeError("missing-data probe returned empty answer")
