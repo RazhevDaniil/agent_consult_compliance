@@ -34,6 +34,21 @@ def _resolve_trace_id(value: str | None) -> str:
     return str(parsed)
 
 
+def _json_response_with_trace(
+    payload: JsonRpcErrorResponse,
+    trace_id: str,
+    x_session_id: str | None = None,
+) -> JSONResponse:
+    headers = {TRACE_HEADER_NAME: trace_id}
+    if x_session_id:
+        headers["x-session-id"] = x_session_id
+    return JSONResponse(
+        status_code=200,
+        content=payload.model_dump(),
+        headers=headers,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(
@@ -89,10 +104,7 @@ async def orchestrator_rpc(
             id=rpc_id,
             error=JsonRpcError(code=-32602, message=str(exc)),
         )
-        response.headers[TRACE_HEADER_NAME] = trace_id
-        if x_session_id:
-            response.headers['x-session-id'] = x_session_id
-        return JSONResponse(status_code=200, content=error_payload.model_dump())
+        return _json_response_with_trace(error_payload, trace_id, x_session_id)
 
     logger.info(
         "RPC request | method=%s trace_id=%s session_id=%s",
@@ -116,10 +128,7 @@ async def orchestrator_rpc(
             id=rpc_id,
             error=JsonRpcError(code=exc.code, message=exc.message),
         )
-        response.headers[TRACE_HEADER_NAME] = trace_id
-        if x_session_id:
-            response.headers['x-session-id'] = x_session_id
-        return JSONResponse(status_code=200, content=error_payload.model_dump())
+        return _json_response_with_trace(error_payload, trace_id, x_session_id)
     except ValidationError as exc:
         logger.warning(
             "Validation error | method=%s trace_id=%s errors=%s",
@@ -131,10 +140,7 @@ async def orchestrator_rpc(
             id=rpc_id,
             error=JsonRpcError(code=-32602, message=f"Ошибка валидации: {exc.error_count()} нарушение(й)"),
         )
-        response.headers[TRACE_HEADER_NAME] = trace_id
-        if x_session_id:
-            response.headers['x-session-id'] = x_session_id
-        return JSONResponse(status_code=200, content=error_payload.model_dump())
+        return _json_response_with_trace(error_payload, trace_id, x_session_id)
     except Exception:
         logger.exception(
             "Unexpected error | method=%s trace_id=%s",
@@ -145,10 +151,7 @@ async def orchestrator_rpc(
             id=rpc_id,
             error=JsonRpcError(code=-32603, message='Внутренняя ошибка proxy-сервиса'),
         )
-        response.headers[TRACE_HEADER_NAME] = trace_id
-        if x_session_id:
-            response.headers['x-session-id'] = x_session_id
-        return JSONResponse(status_code=200, content=error_payload.model_dump())
+        return _json_response_with_trace(error_payload, trace_id, x_session_id)
 
     logger.debug(
         "RPC response | method=%s trace_id=%s",
